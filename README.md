@@ -1,120 +1,186 @@
 # BME280 Microclimate Forecasting
 
-An end-to-end IoT time-series forecasting system that collects real-world sensor data via a custom data pipeline and compares three machine learning models for 30-minute temperature prediction.
+An end-to-end IoT time-series forecasting system — from embedded firmware to cloud storage to machine learning — that benchmarks three models across multiple prediction horizons for real-world microclimate temperature forecasting.
 
 ## System Architecture
 
 ```
-BME280 Sensor → iOS App → AWS EC2 → sensor_data.csv → ML Models → Predictions
-   (Hardware)   (Collection)  (Storage)    (Processing)              (XGBoost / LSTM / Transformer)
+BME280 Sensor (I2C)
+  → Nordic nRF52 (Zephyr RTOS, 10-sec sampling)
+  → BLE / Nordic UART Service (NUS)
+  → iOS App (BLE Central, HTTP POST)
+  → AWS EC2 (FastAPI + PostgreSQL)
+  → Export Script
+  → sensor_data.csv
+  → ML Models (XGBoost / LSTM / Transformer)
 ```
 
-## Project Overview
+A BME280 environmental sensor is connected via I2C to a Nordic nRF52 development board running Zephyr RTOS. The firmware reads temperature, humidity, and barometric pressure every 10 seconds and broadcasts the data over BLE using the Nordic UART Service (NUS). A custom iOS app acts as a BLE central, parses incoming sensor strings, and forwards readings via HTTP POST to a FastAPI backend running on AWS EC2. Readings are stored in a PostgreSQL database and exported to CSV for model training.
 
-This project was built entirely from scratch — from hardware assembly to cloud infrastructure to model training. A BME280 environmental sensor collects temperature, humidity, and barometric pressure readings every 10 seconds. Data is streamed from an iOS app to an AWS EC2 instance, where it is stored and used to train forecasting models.
+**Design decision:** The sampling interval was deliberately set to 10 seconds (rather than a faster rate) to balance data resolution with storage efficiency, yielding approximately 8,640 readings per day during continuous operation.
 
-**Task:** Given the past 30 minutes of sensor readings, predict the temperature 30 minutes into the future.
+## Task
 
-**Dataset:** ~7 days of 10-second resolution data (≈64,000 rows), collected in Irvine, CA.
+Given a window of historical sensor readings, predict the temperature at a future time horizon.
 
-## Models
+- **Input features:** temperature (°C), humidity (%), barometric pressure (hPa)
+- **Target:** temperature at t + horizon
+- **Horizons evaluated:** 30 minutes, 1 hour, 1.5 hours
+- **Dataset:** ~7 days of 10-second resolution data (64,000+ rows), collected March 2026
+- **Train/Val/Test split:** 60% / 20% / 20% (chronological)
+- **Baseline:** Linear extrapolation from the last 10 observed steps
 
-Three models were implemented and compared:
+## Results
 
-| Model       | Data Granularity | RMSE    | Linear Extrapolation Baseline | Improvement |
-|-------------|------------------|---------|-------------------------------|-------------|
-| LSTM        | 10-sec raw       | 0.745°C | 4.59°C                        | **83.8%**   |
-| XGBoost     | 5-min resampled  | 0.855°C | 1.43°C                        | **40.0%**   |
-| Transformer | 10-sec raw       | 0.978°C | 2.59°C                        | **62.3%**   |
+### 30-Minute Prediction
 
-> Note: XGBoost operates on 5-min resampled data with domain-specific feature engineering, while LSTM and Transformer use raw 10-sec data. Direct RMSE comparison should be interpreted with this in mind.
+| Model | RMSE | Baseline | Improvement |
+|-------|------|----------|-------------|
+| LSTM | 0.745°C | 2.59°C | 71.2% |
+| XGBoost | 0.764°C | 2.59°C | 70.5% |
+| Transformer | 0.978°C | 2.59°C | 62.3% |
+
+### 1-Hour Prediction
+
+| Model | RMSE | Baseline | Improvement |
+|-------|------|----------|-------------|
+| LSTM | 1.243°C | 2.662°C | 53.4% |
+| XGBoost | 1.941°C | 2.662°C | 27.1% |
+| Transformer | 2.696°C | 2.662°C | ~0% |
+
+### 1.5-Hour Prediction
+
+| Model | RMSE | Baseline | Improvement |
+|-------|------|----------|-------------|
+| LSTM | 1.514°C | 2.841°C | 46.7% |
+| XGBoost | 1.802°C | 2.841°C | 36.6% |
+| Transformer | 1.711°C | 2.841°C | 39.8% |
 
 ## Key Findings
 
-**LSTM outperforms Transformer on this task.** This is consistent with the literature: Transformer's self-attention advantage emerges in high-dimensional, long-range dependency settings. With only 3 input features and smooth temporal dynamics, LSTM's inductive bias for sequential patterns is better suited.
+**LSTM is the strongest model across all horizons.** It achieves the best RMSE at every prediction window, with the largest advantage at short horizons (71.2% improvement at 30 minutes).
 
-**XGBoost benefits from domain-specific feature engineering.** Features such as dewpoint deficit (temperature − dewpoint) and pressure tendency encode meteorological knowledge that helps the model capture humidity-driven cooling patterns.
+**Transformer underperforms on this task — by design.** Transformer's self-attention mechanism is best suited for high-dimensional data with complex long-range dependencies. With only 3 input features and smooth temporal dynamics, LSTM's sequential inductive bias is better matched to this problem. This is consistent with findings in the time-series literature.
 
-**All models exhibit systematic underestimation during sustained cooling periods.** Error analysis reveals that the test set (final 20% of data by time) captures a prolonged cooling phase. Models trained on more volatile heating events tend to underestimate the magnitude of gradual cooling — a known challenge in real-world IoT sensor forecasting.
+**Transformer partially recovers at longer horizons.** At 1 hour, Transformer barely beats the linear baseline (~0%). At 1.5 hours, it recovers to 39.8% — suggesting that longer input sequences give attention more signal to work with.
 
-**Overfitting is observed across all models**, attributable to the limited dataset size (7 days) and high temporal autocorrelation in IoT sensor data. This motivates continued data collection.
+**XGBoost degrades faster than LSTM at longer horizons.** XGBoost is nearly on par with LSTM at 30 minutes (70.5% vs 71.2%), but falls behind at 1 hour (27.1%) and 1.5 hours (36.6%). This reflects the limitation of flat feature vectors for capturing long-range temporal patterns.
 
-## Feature Engineering (XGBoost)
+**All models exhibit overfitting.** With only 7 days of data and high temporal autocorrelation in IoT sensor readings, train loss decreases consistently while validation loss plateaus. This motivates continued data collection.
 
-```python
-# Dewpoint deficit — proxy for evaporative cooling potential
-dewpoint = Magnus formula(temperature, humidity)
-differences = temperature - dewpoint
+## Data Pipeline
 
-# Tendency features — rate of change over past 30 minutes
-pressure_tendency   = pressure_hpa.diff(6)
-humidity_tendency   = differences.diff(6)
-temperature_tendency = temperature_c.diff(6)
+### Embedded Firmware (Zephyr RTOS / Nordic nRF52)
+
+The firmware is written in C using Zephyr RTOS and runs on a Nordic nRF52 development board.
+
+Key implementation details:
+- BME280 connected via I2C, read using Zephyr sensor API
+- Data transmitted over BLE using Nordic UART Service (NUS)
+- Sampling interval: 10 seconds (configurable via `BME280_SAMPLE_INTERVAL_MS`)
+- Output format: `T=XX.XXC H=XX.XX% P=XXXX.XXhPa` parsed by iOS app via regex
+
+```c
+sensor_sample_fetch(bme280_dev);
+sensor_channel_get(bme280_dev, SENSOR_CHAN_AMBIENT_TEMP, &temp);
+sensor_channel_get(bme280_dev, SENSOR_CHAN_HUMIDITY, &hum);
+sensor_channel_get(bme280_dev, SENSOR_CHAN_PRESS, &press);
+
+snprintk(nus_msg, sizeof(nus_msg), "T=%.2fC H=%.2f%% P=%.2fhPa\r\n", ...);
+bt_nus_send(NULL, (uint8_t *)nus_msg, len);
+```
+
+### iOS App (BLE Central)
+
+A custom iOS app connects to the nRF52 as a BLE central, parses incoming sensor strings, and forwards each reading via HTTP POST to the EC2 backend.
+
+### EC2 Backend (FastAPI + PostgreSQL)
+
+The backend is built with FastAPI and stores readings in a PostgreSQL database on AWS EC2.
+
+Key endpoints:
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/experiment-sessions` | Create a new experiment session |
+| GET | `/experiment-sessions` | List all sessions |
+| POST | `/sensor-readings` | Ingest a single reading |
+| POST | `/sensor-readings/batch` | Batch ingest readings |
+| GET | `/sensor-readings` | Query readings by session and time range |
+
+Sensor readings are stored in a PostgreSQL database on EC2. A lightweight export script queries the database and writes readings to `sensor_data.csv` for model training.
 
 ## Model Details
 
 ### LSTM
-- Input: 180 timesteps × 3 features (30 min history at 10-sec resolution)
+- Input: sliding window x 3 features at 10-second resolution
 - Architecture: 2-layer LSTM, hidden size 64, dropout 0.2
-- Trained with early stopping on validation loss
+- Training: Adam optimizer, early stopping on validation loss (checkpoint saved)
+- Scaler: MinMaxScaler fitted on training set only
 
 ### Transformer
-- Input: 180 timesteps × 3 features
-- Architecture: d_model=32, 4 attention heads, 3 encoder layers, dropout 0.1
-- Positional encoding applied; WeightedRandomSampler used to reduce influence of anomalous heating events
+- Input: sliding window x 3 features at 10-second resolution
+- Architecture: d_model=32, 4 attention heads, 3 encoder layers, sinusoidal positional encoding, dropout 0.1
+- Training: WeightedRandomSampler to reduce influence of anomalous high-temperature events
+- Scaler: MinMaxScaler fitted on training set only
 
 ### XGBoost
-- Input: Flattened 12-step lookback window × 4 features (5-min granularity)
-- n_estimators=500, learning_rate=0.04, max_depth=3
-- Early stopping on validation set
+- Input: 5-minute resampled data with domain-specific feature engineering
+- Architecture: n_estimators=500, learning_rate=0.04, max_depth=3, early stopping on validation set
 
-## Data Pipeline
+> Note: XGBoost operates on 5-minute resampled data with meteorological feature engineering, while LSTM and Transformer use raw 10-second data. RMSE values are comparable in magnitude but reflect different input representations.
 
+## Feature Engineering (XGBoost)
+
+```python
+# Dewpoint via Magnus formula
+a, b = 17.27, 237.7
+alpha    = (a * temperature) / (b + temperature) + log(humidity / 100)
+dewpoint = (b * alpha) / (a - alpha)
+
+# Dewpoint deficit - proxy for evaporative cooling potential
+deficit = temperature - dewpoint
+
+# Tendency features - rate of change over past 30 minutes
+pressure_tendency    = pressure_hpa.diff(6)
+humidity_tendency    = deficit.diff(6)
+temperature_tendency = temperature_c.diff(6)
+
+# Cyclic time encoding
+hour_sin = sin(2 * pi * hour / 24)
+hour_cos = cos(2 * pi * hour / 24)
 ```
-BME280 (I2C) → Raspberry Pi / microcontroller
-             → iOS App (custom, HTTP POST)
-             → AWS EC2 (Flask receiver)
-             → sensor_data.csv
-```
-
-Data is collected at 10-second intervals and appended to a local CSV on the EC2 instance. The pipeline handles connection drops and timestamp alignment.
 
 ## Repository Structure
 
 ```
-├── data/
-│   └── sensor_data.csv          # Raw sensor readings
-├── lstm.py                      # LSTM training and evaluation
-├── transformer.py               # Transformer training and evaluation  
-├── xgboost_model.py             # XGBoost with feature engineering
-├── results/
-│   ├── lstm_result.png          # Prediction vs ground truth plots
-│   └── transformer_result.png
-└── README.md
+data/
+    sensor_data.csv                # Raw sensor readings (exported from PostgreSQL)
+data_pipeline/
+    firmware/                      # Zephyr RTOS firmware (C) for Nordic nRF52
+    ios_app/                       # iOS BLE central app (Swift)
+    ec2_receiver/                  # FastAPI + PostgreSQL backend
+models/
+    lstm.ipynb                     # LSTM training and evaluation
+    transformer.ipynb              # Transformer training and evaluation
+    xgboost.ipynb                  # XGBoost with feature engineering
+README.md
 ```
 
 ## Requirements
 
-```
-torch
-xgboost
-scikit-learn
-pandas
-numpy
-matplotlib
-torchinfo
-```
-
-Install with:
 ```bash
 pip install torch xgboost scikit-learn pandas numpy matplotlib torchinfo
 ```
 
-## Limitations & Future Work
+For firmware: Nordic nRF Connect SDK with Zephyr RTOS. See `data_pipeline/firmware/` for build instructions.
 
-- **Data volume:** 7 days of data limits model generalization. Continued collection is underway.
-- **Single location:** All data from one indoor sensor. Multi-sensor deployment would improve robustness.
-- **Anomalous readings:** Sensor occasionally exposed to direct heat sources (up to 53°C), introducing distribution shift between train and test sets.
-- **Future:** Deploy trained model on EC2 for real-time inference; integrate outdoor weather API data as additional features.
+For backend: `pip install fastapi sqlalchemy psycopg2-binary uvicorn python-dotenv`
+
+## Limitations and Future Work
+
+- **Data volume:** 7 days of data limits generalization. Continued collection is underway.
+- **Single sensor:** All data from one indoor location. Anomalous readings from direct heat exposure (up to 53°C) introduce distribution shift between train and test sets.
+- **Future:** Deploy best model (LSTM) on EC2 for real-time inference; explore multi-step forecasting; add second sensor for spatial comparison.
 
 ---
